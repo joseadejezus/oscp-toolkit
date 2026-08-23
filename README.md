@@ -12,12 +12,29 @@ They used to be seven separate scripts in seven separate repos, each with its ow
 copy of the same validation and output-scrubbing code. When I fixed a terminal-injection
 bug in one, the other three kept it. That's why they're one package now.
 
+![nmap-recon output](docs/demo.svg)
+
+*Real captured output, not a mockup — `docs/make_demo.py` records it through rich's
+SVG recorder. Note the exploit-db tiering: `Cassandra Web` was found from the page
+title rather than the service banner (the banner says "Thin httpd"), and the Apache
+hits are labelled **NOT your version** so a near-miss can't read as a finding.*
+
+Each tool prints its own sigil and wordmark on startup, so four tmux panes are
+distinguishable at a glance:
+
 ```
   ▄▄    _  _ __  __   _   ___     ___ ___ ___ ___  _  _
  ▟▘▝▙  | \| |  \/  | /_\ | _ \___| _ \ __/ __/ _ \| \| |
 ▐  ● ▌ | .` | |\/| |/ _ \|  _/___|   / _| (_| (_) | .` |
   ▀▀   |_|\_|_|  |_/_/ \_\_|     |_|_\___\___\___/|_|\_|
        five stages in, one table out
+       oscp-toolkit v2.1.0 · enumeration only
+
+▛▀▜     _    ___ ___  ___  _    ___      ___ _____   _____ _____
+▌ ▐═══ | |  |_ _/ __|/ _ \| |  / _ \ ___| _ \_ _\ \ / / _ \_   _|
+▌ ▐═══ | |__ | | (_ | (_) | |_| (_) |___|  _/| | \ V / (_) || |
+▙▄▟    |____|___\___|\___/|____\___/    |_| |___| \_/ \___/ |_|
+       tunnel up, routes in, out of the way
        oscp-toolkit v2.1.0 · enumeration only
 ```
 
@@ -220,6 +237,17 @@ real BFS pathing over a synthetic BloodHound graph).
 - **`script-logger` timestamps are 1-second resolution**, so events in the same second
   can be slightly mis-ordered in the merged report. The raw transcript is the
   authoritative record.
+
+## Regenerating the demo image
+
+```bash
+python3 docs/make_demo.py                      # self-contained fixture
+python3 docs/make_demo.py 10.10.10.10 ./nmap   # your own stage files
+```
+
+Needs `rich` and `searchsploit`. The banners are deliberately *not* in the SVG —
+rich's export font doesn't tile `_` and `|`, so figlet art fragments into something
+illegible there while looking correct in a real terminal.
 
 ## Licence
 
