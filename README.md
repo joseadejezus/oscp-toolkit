@@ -199,56 +199,6 @@ One caveat that isn't about this code: if you use LinPEAS, keep it in plain
 enumeration mode and never invoke its exploit features. That's the exact scenario
 OffSec has publicly ruled on.
 
-## Testing
-
-```bash
-pip install -e '.[dev]'
-pytest -q
-```
-
-68 tests covering the shared validators against the injection payload set, the
-terminal-injection scrubbing (asserted as a byte count, not a look), the banner
-geometry, and the cross-tool invariants — identical JSON envelope, no duplicated
-helpers, no `shell=True`, every entry point resolving.
-
-Beyond that, each tool was exercised against a purpose-built harness: real
-`hashcat` and `John` for `hash-triage`, real HTTP transfers for `http-serve`, real
-`script`/bash/zsh sessions for `script-logger`, and fake binaries mirroring genuine
-output for the tools whose real dependencies can't run in a build sandbox
-(`nxc`, `bloodyAD`, Impacket, `ip`, the ligolo proxy, and a fake bolt driver doing
-real BFS pathing over a synthetic BloodHound graph).
-
-### Honest gaps
-
-- **No live targets in the build sandbox.** Sequencing, parsing, validation and both
-  render paths are proven against fakes, but the on-wire seams — exact flag syntax
-  of each `ad-enum` fallback tool, a real `tun` interface, a real ligolo proxy TUI,
-  a real VPN interface for `http-serve`'s IP detection — are schema-reviewed, not
-  live-run. Expect a small parsing tweak on first contact, as happened with
-  `nmap-recon` on a real box.
-- **`bh-quickwin`'s Cypher was never executed against a real Neo4j.** The fake driver
-  proves the pipeline and the pathing logic; a property-name mismatch is the likeliest
-  first-run surprise.
-- **nxc output format drifts between versions.** `ad-enum` keys off self-identifying
-  signals (hash prefixes, `membercount:`, `MachineAccountQuota:`) so a version bump
-  usually costs a row, not a finding. The raw per-stage `.log` is authoritative.
-- **`http-serve`'s request log** parses CPython's `http.server` format. If that ever
-  changes, the summary silently reads "no requests" — `--raw` is the escape hatch.
-- **`script-logger` timestamps are 1-second resolution**, so events in the same second
-  can be slightly mis-ordered in the merged report. The raw transcript is the
-  authoritative record.
-
-## Regenerating the demo image
-
-```bash
-python3 docs/make_demo.py                      # self-contained fixture
-python3 docs/make_demo.py 10.10.10.10 ./nmap   # your own stage files
-```
-
-Needs `rich` and `searchsploit`. The banners are deliberately *not* in the SVG —
-rich's export font doesn't tile `_` and `|`, so figlet art fragments into something
-illegible there while looking correct in a real terminal.
-
 ## Licence
 
 MIT — see [LICENSE](LICENSE).
