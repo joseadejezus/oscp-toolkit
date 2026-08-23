@@ -1,0 +1,26 @@
+# Never commit real evidence or anything a run produces.
+nmap/
+loot/
+ad-enum/
+hash-triage/
+shell-logs/
+targets/
+*_session.log
+*_timeline.log
+*_timeline.txt
+*_markers.log
+kerb.*.txt
+asrep.*.txt
+cracked.txt
+*.potfile
+hashes.m*.txt
+*.log
+
+# Build + tooling
+dist/
+build/
+*.egg-info/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
