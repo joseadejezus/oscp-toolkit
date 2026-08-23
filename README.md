@@ -199,6 +199,15 @@ One caveat that isn't about this code: if you use LinPEAS, keep it in plain
 enumeration mode and never invoke its exploit features. That's the exact scenario
 OffSec has publicly ruled on.
 
+## Known gaps
+
+Nothing here has touched a real target yet — every on-wire seam is tested against
+fakes, so expect a small parsing tweak on first contact. Specifically: `bh-quickwin`'s
+Cypher has never run against a live Neo4j; `ad-enum` keys off nxc output that drifts
+between versions, so the raw per-stage `.log` is authoritative; and `http-serve`'s
+request log parses CPython's `http.server` format — if that ever changes the summary
+silently reads "no requests", and `--raw` is the escape hatch.
+
 ## Licence
 
 MIT — see [LICENSE](LICENSE).
