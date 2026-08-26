@@ -204,6 +204,35 @@ def extract_ports(alltcp_file: Path) -> str:
     return ",".join(ports)
 
 
+def backfill_alltcp_from_quick(
+    alltcp_ports: str, quick_file: Path
+) -> tuple[str, set[str]]:
+    """alltcp's --min-rate=5000 full-range scan can outrun a slow/lab link and
+    drop probes silently - nmap reports "filtered", not an error, so nothing
+    else notices. If 'quick' already confirmed a port open (top ~1000, run
+    first, much slower/safer rate) and alltcp's full-range pass missed it,
+    that's not a real state change - it's packet loss. Union it back in so
+    deep/vuln still get a shot at it.
+
+    Returns (backfilled port list, the set of ports that had to be added).
+    """
+    alltcp_set = {p for p in alltcp_ports.split(",") if p} if alltcp_ports else set()
+    if not quick_file.is_file():
+        return alltcp_ports, set()
+
+    quick_open = {
+        port_num
+        for (port_num, proto), port in parse_on_file(quick_file).items()
+        if proto == "tcp" and port.state == "open"
+    }
+    missed = quick_open - alltcp_set
+    if not missed:
+        return alltcp_ports, set()
+
+    alltcp_set |= missed
+    return ",".join(sorted(alltcp_set, key=int)), missed
+
+
 def run_live(
     ip: str,
     outdir: Path,
@@ -234,7 +263,15 @@ def run_live(
             print(f"[!] Stage '{stage}' exited with status {rc} (continuing).", file=sys.stderr)
 
         if stage == "alltcp" and out_file.is_file():
-            ports = extract_ports(out_file)
+            ports, missed = backfill_alltcp_from_quick(extract_ports(out_file), outdir / f"quick.{ip}")
+            if missed:
+                print(
+                    f"[!] alltcp missed {len(missed)} port(s) 'quick' already found open: "
+                    f"{','.join(sorted(missed, key=int))} - likely packet loss from --min-rate=5000 "
+                    "outrunning this link, not that the ports closed. Adding them back for deep/vuln. "
+                    "If this keeps happening, rerun alltcp with --extra-args '--min-rate=1000' (or lower).",
+                    file=sys.stderr,
+                )
             if ports:
                 print(f"   open TCP ports: {ports}")
             else:
@@ -336,9 +373,25 @@ def merge_stage_outputs(ip: str, outdir: Path) -> tuple[str, dict[tuple[str, str
     combined: dict[tuple[str, str], Port] = {}
 
     # Baseline from quick (top ~1000), then overlay deep's authoritative results.
+    # deep is normally more trustworthy (targeted -sC/-sV on a known port), but
+    # if it regresses a port from open -> filtered/closed while quick already
+    # confirmed it open, that's almost always scan noise (packet loss, a rate
+    # limit tripped by the alltcp burst) rather than a real state change -
+    # keep quick's result and say so, instead of silently reporting a false
+    # negative as if it were a clean "nothing here."
     for stage in ("quick", "deep"):
         if stage in present:
             for key, port in parse_on_file(present[stage]).items():
+                existing = combined.get(key)
+                if stage == "deep" and existing is not None:
+                    if existing.state == "open" and port.state != "open":
+                        existing.script_hits.extend(port.script_hits)
+                        notes.append(
+                            f"{key[0]}/{key[1]}: deep reported '{port.state}' but quick found it "
+                            "open - kept quick's result (looks like scan noise, not a real state "
+                            "change). Rerun 'deep' alone to confirm either way."
+                        )
+                        continue
                 combined[key] = port
 
     # alltcp only tells us port numbers exist (no -sV) - fill in any TCP ports

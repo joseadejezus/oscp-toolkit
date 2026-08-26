@@ -147,6 +147,30 @@ ad-enum "writable"     → confirm the abuse path in       → bh-quickwin wins
 nmap-recon --json      → ports worth a closer look
 ```
 
+## Known gotchas
+
+**nmap-recon's `alltcp` stage can undercount ports on a slow/lab link.** It runs
+`nmap -p- --min-rate=5000`, and on a link with real latency (VPN into a lab box,
+~70-80ms RTT) that rate can outrun what the link will carry — nmap reports the
+dropped probes as "filtered," not an error, so nothing flags it. Symptom: `deep`
+then rescans a *smaller* port list than what's actually open, and if that rescan
+hits the same packet loss, its "filtered" result used to silently overwrite the
+real "open" data `quick` already had — you'd get a full, clean-looking table full
+of "no known hit" that was actually just noise, not a real negative.
+
+Fixed as of the version in this repo: if `quick` (top ~1000, slower/safer rate,
+runs first) already found a port open and `alltcp`'s full-range pass missed it,
+that port gets backfilled into what `deep`/`vuln` scan, with a `[!]` warning on
+stderr. And `merge_stage_outputs` no longer lets a `deep`/`vuln` regression
+(open → filtered) clobber a `quick` result that already confirmed the port —
+it keeps `quick`'s data and adds a note instead, visible in `notes` in every
+render (rich table, plain, JSON).
+
+If you keep seeing the `[!] alltcp missed N port(s)...` warning on a given
+target, that's the link, not the tool — rerun `alltcp` with a lower rate
+(`--extra-args '--min-rate=1000'`, or drop it entirely) rather than trusting
+that scan's port list.
+
 ## Security practices
 
 Every tool follows [project-codeguard](https://github.com/cosai-oasis/project-codeguard),
