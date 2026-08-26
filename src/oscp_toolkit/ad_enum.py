@@ -35,7 +35,7 @@ from ._common.cli import ToolParser, add_global_flags, build_epilog
 from ._common.exits import EXIT_INTERRUPTED, EXIT_NO_DATA, EXIT_OK, EXIT_USAGE
 from ._common.jsonout import emit as emit_json
 from ._common.jsonout import envelope
-from ._common.text import bold, fmt_duration, scrub
+from ._common.text import bold, colour, dim, fmt_duration, scrub, scrub_line
 from ._common.validate import (
     EMPTY_LM,
     ValidationError,
@@ -280,6 +280,45 @@ class StageResult:
     used_fallback: bool = False
 
 
+# nxc and bloodyAD colour their own output, but only when they're talking to a
+# terminal - we capture through a pipe so we can parse and save it, so what comes
+# back is flat text. Rather than give that up, we re-add colour on the way out.
+# Everything below is applied to text that came off the target box, so each line
+# is scrubbed first and the escapes we add are our own.
+_HASH_RE = re.compile(r"\$krb5[a-z]+\$\S+")
+_HDR_ROW_RE = re.compile(r"^\s*-[A-Za-z]")
+
+
+def _echo_tool_output(text: str) -> None:
+    """Print a wrapped tool's output, scrubbed, with the noise turned down."""
+    for raw in text.rstrip().splitlines():
+        line = scrub_line(raw)
+        if not line.strip():
+            print()
+            continue
+
+        # The "LDAP  10.1.73.141  389  DC01" prefix repeats on every single line
+        # and is the same every time - keep it (this should still look like nxc)
+        # but dim it so it stops competing with the data beside it.
+        m = _NXC_PREFIX_RE.match(line)
+        prefix, body = (m.group(0), line[m.end():]) if m else ("", line)
+        out = dim(prefix) if prefix else ""
+
+        stripped = body.lstrip()
+        if stripped.startswith("[+]"):
+            body = colour(body, "32")            # success / creds confirmed
+        elif stripped.startswith("[-]") or stripped.startswith("[!]"):
+            body = colour(body, "31")            # failure - worth catching the eye
+        elif stripped.startswith("[*]"):
+            body = colour(body, "36")            # informational
+        elif _HDR_ROW_RE.match(body):
+            body = bold(body)                    # -Username- / -Group- header rows
+        elif _HASH_RE.search(body):
+            body = _HASH_RE.sub(lambda mm: colour(mm.group(0), "33"), body)
+
+        print(out + body)
+
+
 def run_cmd(cmd: list[str], ctx: Ctx, timeout: int) -> tuple[Optional[int], str]:
     """Run one argv (shell=False), capture combined output, echo it live-ish.
 
@@ -300,7 +339,7 @@ def run_cmd(cmd: list[str], ctx: Ctx, timeout: int) -> tuple[Optional[int], str]
         return None, ""   # binary missing - signal caller to consider fallback
     out = (proc.stdout or "") + (proc.stderr or "")
     if out.strip():
-        print(out.rstrip())
+        _echo_tool_output(out)
     return proc.returncode, out
 
 
@@ -373,6 +412,18 @@ _KRB5ASREP_RE = re.compile(r"\$krb5asrep\$\S+")
 _TGS_NAME_RE = re.compile(r"\$krb5tgs\$\d+\$\*([^*$]+)\$")
 _ASREP_NAME_RE = re.compile(r"\$krb5asrep\$\d+\$([^@:]+)@")
 _MAQ_RE = re.compile(r"MachineAccountQuota:\s*(\d+)", re.IGNORECASE)
+_ENUM_COUNT_RE = re.compile(r"enumerated\s+(\d+)\s+domain\s+users", re.IGNORECASE)
+# nxc column headers: "-Username-  -Last PW Set- …" and "-Group-  -Members- …".
+# These are what actually delimit the two tables - the "Enumerated N" banner only
+# opens the first one and nothing closes it, which is how group rows used to end
+# up in the user list.
+_USER_HDR_RE = re.compile(r"^-Username-", re.IGNORECASE)
+_GROUP_HDR_RE = re.compile(r"^-Group-", re.IGNORECASE)
+# "Remote Desktop Users      2      Members in this group are granted …"
+# Two-or-more spaces is what separates nxc's columns; a single space is inside a
+# group name. Only ever applied inside the groups section - a user row would
+# otherwise match it via the BadPW column.
+_GROUP_ROW_RE = re.compile(r"^(?P<name>\S.*?)\s{2,}(?P<n>\d+)(?:\s{2,}(?P<desc>.*))?$")
 _SKEW_RE = re.compile(r"KRB_AP_ERR_SKEW|clock skew too great|clock skew", re.IGNORECASE)
 
 
@@ -383,6 +434,9 @@ def _strip_prefix(line: str) -> str:
 @dataclass
 class Findings:
     users: list[str] = field(default_factory=list)
+    # What nxc's "Enumerated N domain users" banner claimed, so the render can
+    # cross-check it against what we actually parsed instead of trusting the parse.
+    users_expected: Optional[int] = None
     groups: list[tuple[str, str]] = field(default_factory=list)
     passpol: list[tuple[str, str]] = field(default_factory=list)
     kerberoastable: list[tuple[str, str]] = field(default_factory=list)
@@ -412,17 +466,44 @@ _FALLBACK_MARK_RE = re.compile(r"^#\s*fallback:\s*(.+?)\s*$")
 
 
 def parse_enum(text: str, f: Findings) -> None:
-    lines = text.splitlines()
-    in_users = False
-    for raw in lines:
+    """Parse the enum stage into users / groups / password policy.
+
+    nxc prints the user table and the group table back to back with nothing
+    between them but a header row, so this tracks which table it's inside.
+    Getting that wrong is not a cosmetic problem: the first word of every group
+    name ("Print Operators" -> "Print") used to land in the user list, and the
+    real user count got buried in ~40 rows of junk.
+    """
+    section: Optional[str] = None   # None | "users" | "groups"
+    for raw in text.splitlines():
         mark = _FALLBACK_MARK_RE.match(raw.strip())
         if mark:
             # A bare-list fallback section is users until the next section starts.
-            in_users = mark.group(1).lower().endswith("users")
+            section = "users" if mark.group(1).lower().endswith("users") else None
             continue
 
         body = _strip_prefix(raw)
         low = body.lower()
+
+        # Column headers delimit the tables - and the group header is what closes
+        # the user table.
+        if _USER_HDR_RE.match(body):
+            section = "users"
+            continue
+        if _GROUP_HDR_RE.match(body):
+            section = "groups"
+            continue
+
+        # Any status line ends whichever table we were in: nxc emits "[+] Dumping
+        # password info…" straight after the groups, with no blank line.
+        if _STATUS_RE.match(body):
+            m = _ENUM_COUNT_RE.search(body)
+            if m:
+                f.users_expected = int(m.group(1))
+                section = "users"
+            else:
+                section = None
+            continue
 
         # password policy: key: value lines (nxc or ldapsearch shapes)
         matched_pol = False
@@ -435,9 +516,11 @@ def parse_enum(text: str, f: Findings) -> None:
                 matched_pol = True
                 break
         if matched_pol:
-            continue  # don't let "Minimum password length" fall into the user list
+            section = None   # policy block means both tables are done
+            continue
 
-        # groups: "GroupName   membercount: N"
+        # ldeep-style "GroupName   membercount: N" - shape is unambiguous, so it
+        # doesn't need the section gate.
         m = re.search(r"^(.*?)\s+membercount:\s*(\d+)", body, re.IGNORECASE)
         if m:
             g = (m.group(1).strip(), m.group(2))
@@ -445,15 +528,18 @@ def parse_enum(text: str, f: Findings) -> None:
                 f.groups.append(g)
             continue
 
-        # users: rows after the "Enumerated N domain users" banner
-        if "domain users" in low and ("enumerated" in low or "total" in low):
-            in_users = True
+        if not body.strip():
             continue
-        if in_users:
-            if _STATUS_RE.match(body) or not body:
-                continue
-            if body.lstrip().startswith("-") and body.rstrip().endswith("-"):
-                continue  # -Username-  -Last PW Set- ... header row
+
+        if section == "groups":
+            m = _GROUP_ROW_RE.match(body)
+            if m:
+                g = (m.group("name").strip(), m.group("n"))
+                if g[0] and g not in f.groups:
+                    f.groups.append(g)
+            continue
+
+        if section == "users":
             token = body.split()[0] if body.split() else ""
             if token and token not in f.users and not token.startswith("["):
                 f.users.append(token)
@@ -608,6 +694,15 @@ def _post_process(ctx: Ctx, f: Findings) -> None:
 
 
 def render_report(ctx: Ctx, f: Findings) -> None:
+    # nxc tells us how many users it found; if our parse disagrees, say so rather
+    # than rendering a confident table built on a bad parse. This is exactly the
+    # failure that shipped once - group rows leaking into the user list turned 6
+    # users into 49, and nothing flagged it.
+    if f.users_expected is not None and len(f.users) != f.users_expected:
+        _warn(f"user count mismatch: nxc reported {f.users_expected}, parsed "
+              f"{len(f.users)}. The Users table below is probably wrong - trust "
+              f"the raw stage output above it and please report the format change.")
+
     if f.skew_seen:
         _err("Kerberos CLOCK SKEW error seen in stage output - roasting almost "
              "certainly came back empty because of it. Sync time to the DC "

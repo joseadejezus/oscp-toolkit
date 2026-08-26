@@ -171,6 +171,15 @@ target, that's the link, not the tool — rerun `alltcp` with a lower rate
 (`--extra-args '--min-rate=1000'`, or drop it entirely) rather than trusting
 that scan's port list.
 
+**ad-enum's Users table used to include group names.** nxc prints the user table
+and the group table back to back, and nothing closed the first one - so the first
+word of every group (`Print Operators` -> `Print`) landed in the user list, and a
+6-user domain rendered as 49 "users". Fixed by tracking which table the parser is
+inside; the group table nxc actually prints is now parsed too (it never was, so the
+Groups panel silently never appeared). ad-enum also cross-checks its parse against
+nxc's own "Enumerated N domain users" count and warns loudly on a mismatch rather
+than rendering a confident wrong table.
+
 ## Security practices
 
 Every tool follows [project-codeguard](https://github.com/cosai-oasis/project-codeguard),

@@ -28,6 +28,22 @@ def scrub(text: str, limit: int = 300) -> str:
     return re.sub(r"\s+", " ", text).strip()[:limit]
 
 
+def scrub_line(text: str, limit: int = 2000) -> str:
+    """Like scrub(), but keeps the spacing.
+
+    scrub() collapses runs of whitespace, which is right for a value going into a
+    table cell and wrong for a tool's own output that we're echoing through -
+    nxc and bloodyAD align their output in columns, and collapsing the runs turns
+    a readable table into one long smear. Same escape/control-byte stripping,
+    spacing left alone.
+    """
+    text = _ANSI_OSC_RE.sub("", text)
+    text = _ANSI_CSI_RE.sub("", text)
+    text = text.replace("\x1b", "")
+    text = _CTRL_RE.sub("", text)
+    return text[:limit]
+
+
 def _colour_ok(stream=None) -> bool:
     stream = stream or sys.stdout
     return stream.isatty() and not os.environ.get("NO_COLOR")

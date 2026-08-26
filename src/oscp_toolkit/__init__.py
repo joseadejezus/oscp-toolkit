@@ -16,4 +16,4 @@ exploit, and none of them chains one finding into the next attack. See the READM
 for where that line sits and why each tool stops where it does.
 """
 
-__version__ = "2.1.1"
+__version__ = "2.1.2"
