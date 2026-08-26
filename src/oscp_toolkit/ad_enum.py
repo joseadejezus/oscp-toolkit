@@ -35,7 +35,7 @@ from ._common.cli import ToolParser, add_global_flags, build_epilog
 from ._common.exits import EXIT_INTERRUPTED, EXIT_NO_DATA, EXIT_OK, EXIT_USAGE
 from ._common.jsonout import emit as emit_json
 from ._common.jsonout import envelope
-from ._common.text import bold, colour, dim, fmt_duration, scrub, scrub_line
+from ._common.text import bold, colour, dim, fmt_duration, scrub_line
 from ._common.validate import (
     EMPTY_LM,
     ValidationError,
@@ -600,9 +600,15 @@ def parse_writable(text: str, f: Findings) -> None:
 
 def _scrub_log(text: str) -> str:
     """AD output is remote-controlled text - a sAMAccountName or an LDAP attribute
-    can carry escape sequences. Scrub per line (so line structure survives) before
-    anything parses or displays it, the same way the other tools do."""
-    return "\n".join(scrub(line, limit=1000) for line in text.splitlines())
+    can carry escape sequences. Scrub per line before anything parses or displays it.
+
+    Uses scrub_line, not scrub: scrub() collapses runs of whitespace, and nxc
+    separates its group columns with exactly that. Collapsing them here meant
+    parse_enum received "Administrators 3 Administrators have complete..." and
+    could no longer tell the group name from the member count - the group table
+    came out empty on every real run. Escapes and control bytes are still stripped;
+    only the spacing survives."""
+    return "\n".join(scrub_line(line, limit=1000) for line in text.splitlines())
 
 
 def build_findings(logs: dict[str, str]) -> Findings:
