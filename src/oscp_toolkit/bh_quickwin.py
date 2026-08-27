@@ -189,6 +189,20 @@ RETURN collect(DISTINCT x.name) AS matched
 
 Q_OWNED_COUNT = "MATCH (o) WHERE o.owned = true RETURN count(o) AS c"
 
+# Contains/GPLink describe AD *structure* (this OU holds that computer, this GPO is
+# linked there) - not control. shortestPath() below has no type filter, so it'll
+# happily walk WriteOwner(gpo) -[GPLink]-> ou -[Contains]-> some unrelated Group and
+# report that as a path to Domain Admins. That's wrong: containment never grants
+# control over the contained object. Neo4j 4.4 (what BloodHound CE ships) can't
+# exclude relationship types inside a variable-length pattern without APOC, so this
+# is enforced as a post-query filter in gather() instead of in the Cypher itself -
+# meaning a rejected path isn't replaced by the next-best real one, it's just
+# dropped and reported as "no path found" via a note. False negative over false
+# positive, on purpose: GPO-based attack paths still need manual "what does this
+# GPO apply to" verification (BloodHound GUI or `bloodyAD ... get object <gpo>`),
+# they are not something this query can safely automate.
+_STRUCTURAL_EDGE_TYPES = {"Contains", "GPLink"}
+
 # shortestPath length limit is substituted from a validated int (or '' = unbounded).
 Q_PATHS_TMPL = """
 MATCH (o) WHERE o.owned = true
@@ -289,6 +303,20 @@ def _scrub_rows(rows: list[dict]) -> list[dict]:
     return cleaned
 
 
+def _drop_structural_paths(rows: list[dict]) -> tuple[list[dict], int]:
+    """Reject any candidate path that leans on a structural edge anywhere in the
+    chain, not just at the end - a Contains/GPLink hop in the *middle* is just as
+    bogus as one at the tail. See the _STRUCTURAL_EDGE_TYPES comment above."""
+    kept, dropped = [], 0
+    for row in rows:
+        edges = row.get("edge_types") or []
+        if any(e in _STRUCTURAL_EDGE_TYPES for e in edges):
+            dropped += 1
+        else:
+            kept.append(row)
+    return kept, dropped
+
+
 def gather(client: Neo4jClient, domain: Optional[str], rids: list[str],
            own: Optional[list[str]], max_hops: Optional[int]) -> QuickWins:
     wins = QuickWins()
@@ -317,7 +345,15 @@ def gather(client: Neo4jClient, domain: Optional[str], rids: list[str],
     else:
         maxhops = str(max_hops) if max_hops else ""
         query = Q_PATHS_TMPL.format(maxhops=maxhops)
-        wins.paths = _scrub_rows(client.read(query, rids=rids))
+        raw_paths = _scrub_rows(client.read(query, rids=rids))
+        wins.paths, dropped = _drop_structural_paths(raw_paths)
+        if dropped:
+            wins.notes.append(
+                f"Dropped {dropped} candidate path(s) that only reached the target via "
+                f"structural edges ({', '.join(sorted(_STRUCTURAL_EDGE_TYPES))}) rather than "
+                "real control - containment isn't compromise. If a GenericAll/WriteOwner/"
+                "GenericWrite hit on a GPO looked promising, check its linked scope manually."
+            )
 
     return wins
 

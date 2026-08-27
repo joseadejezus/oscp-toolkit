@@ -234,12 +234,28 @@ OffSec has publicly ruled on.
 
 ## Known gaps
 
-Nothing here has touched a real target yet — every on-wire seam is tested against
-fakes, so expect a small parsing tweak on first contact. Specifically: `bh-quickwin`'s
-Cypher has never run against a live Neo4j; `ad-enum` keys off nxc output that drifts
-between versions, so the raw per-stage `.log` is authoritative; and `http-serve`'s
-request log parses CPython's `http.server` format — if that ever changes the summary
-silently reads "no requests", and `--raw` is the escape hatch.
+`ad-enum` keys off nxc output that drifts between versions, so the raw per-stage
+`.log` is authoritative; and `http-serve`'s request log parses CPython's
+`http.server` format — if that ever changes the summary silently reads "no
+requests", and `--raw` is the escape hatch.
+
+`bh-quickwin` has now run against a live BloodHound CE graph (2026-08-26,
+SYSCO.LOCAL). That run found a real bug: the `wins` shortest-path query had no
+relationship-type filter, so it happily walked `Contains`/`GPLink` (AD
+*structure* — this OU holds that computer, this GPO is linked there) as if
+they were control edges, and reported a path to Domain Admins that was only
+genuine for its first few hops. Fixed in 2.1.4 by rejecting any candidate path
+that touches a structural edge anywhere in the chain, rather than trying to
+guess which GPO-scope hops are meaningful. **Still open:** this makes
+GPO-abuse paths (WriteOwner/GenericWrite/GenericAll on a GPO) disappear from
+`wins` entirely rather than resolving them correctly — Neo4j 4.4 can't exclude
+relationship types from a variable-length pattern without APOC, so there's no
+cheap way to keep the real GPO-scope hop and still drop the bogus containment
+one. Check GPO-linked scope by hand (BloodHound GUI or `bloodyAD` reads) when
+a GPO shows up as writable. Also unconfirmed: whether `rusthound` (the
+collector used for that run) requests Session/ACL edges by default — until
+that's checked, an empty `wins` result on a rusthound-collected graph could
+mean "no path" or "collector didn't gather what a path needs".
 
 ## Licence
 
