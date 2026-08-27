@@ -93,6 +93,16 @@ QUERY_TIMEOUT_SECONDS = 120  # server-side per-transaction cap
 _NAME_RE = re.compile(r"^[A-Za-z0-9._@$-]+$")
 _URI_RE = re.compile(r"^(?:bolt|neo4j)(?:\+s|\+ssc)?://[A-Za-z0-9._:\[\]-]+$")
 _RID_RE = re.compile(r"^\d+$")
+# GPO display names are the one place real AD data has spaces and braces
+# ("Default Domain Policy@CORP.LOCAL", "{31B2F340-016D-11D2-945F-00C04FB984F9}"),
+# so _NAME_RE is too tight for them. Deliberately still excludes $ & ( ) ' - a
+# first cut allowed those for names like "Sales & Marketing (2024)" and it let
+# "$(whoami)" and "&& reboot" straight through the validator. Nothing here shells
+# out and every query is parameterised, so that was only theoretical - but a
+# validator that accepts a command substitution isn't one. A GPO whose real name
+# needs those characters is still reachable by its objectid GUID, which the
+# lookup below accepts alongside the name.
+_GPO_NAME_RE = re.compile(r"^[A-Za-z0-9._@ {}-]+$")
 
 
 def validate_uri(uri: str) -> str:
@@ -137,6 +147,24 @@ def validate_rids(raw: str) -> list[str]:
     if not suffixes:
         raise ValidationError("No valid target RIDs parsed (expected e.g. '512').")
     return suffixes
+
+
+def validate_gpo_name(name: Optional[str]) -> Optional[str]:
+    """Upper-cased to match BloodHound's schema, same as --own."""
+    if name is None:
+        return None
+    name = name.strip()
+    if not name:
+        raise ValidationError("GPO name was empty.")
+    if not _GPO_NAME_RE.match(name):
+        raise ValidationError(
+            f"Refusing suspicious GPO name: {name!r}\n"
+            "       (letters, digits, space and . _ - @ { } only - if the real name "
+            "needs other\n       characters, pass the GPO's objectid GUID instead)"
+        )
+    if not any(ch.isalnum() for ch in name):
+        raise ValidationError(f"GPO name has no alphanumeric content: {name!r}")
+    return name.upper()
 
 
 def validate_max_hops(value: Optional[int]) -> Optional[int]:
@@ -216,6 +244,40 @@ RETURN o.name AS source, g.name AS target,
 ORDER BY hops, source
 """
 
+# Who can rewrite a GPO. Deliberately only *control* edges - this is the same
+# distinction the path filter above enforces, applied at the GPO itself.
+Q_GPO_CONTROLLERS = """
+MATCH (p)-[r:Owns|GenericAll|GenericWrite|WriteOwner|WriteDacl|AllExtendedRights]->(g:GPO)
+WHERE ($name IS NULL OR toUpper(g.name) = $name OR toUpper(g.objectid) = $name)
+OPTIONAL MATCH (m)-[:MemberOf*1..5]->(p)
+WHERE m:User OR m:Computer
+RETURN g.name AS gpo, p.name AS principal, labels(p) AS principal_labels,
+       type(r) AS edge, coalesce(p.owned, false) AS owned,
+       collect(DISTINCT {name: m.name, owned: coalesce(m.owned, false)}) AS members
+ORDER BY gpo, principal
+"""
+
+# THE scope walk. Contains/GPLink are exactly the right edges for this question
+# ("what does this policy apply to") even though they're exactly the wrong ones
+# for "what did I compromise" - see _STRUCTURAL_EDGE_TYPES. blocksinheritance and
+# the link's enforced flag come back raw; the precedence rule between them is
+# applied in Python, not here.
+Q_GPO_SCOPE = """
+MATCH (g:GPO) WHERE toUpper(g.name) = $name OR toUpper(g.objectid) = $name
+MATCH (g)-[l:GPLink]->(scope)
+OPTIONAL MATCH path = (scope)-[:Contains*0..10]->(t)
+WHERE t:Computer OR t:User
+OPTIONAL MATCH (t)-[:MemberOf*1..3]->(dcg:Group)
+WHERE dcg.objectid ENDS WITH '-516'
+RETURN g.name AS gpo, scope.name AS scope_name, labels(scope) AS scope_labels,
+       coalesce(l.enforced, false) AS enforced,
+       t.name AS target_name, labels(t) AS target_labels,
+       count(dcg) > 0 AS is_dc,
+       [n IN nodes(path) | n.name] AS chain,
+       [n IN nodes(path) | coalesce(n.blocksinheritance, false)] AS blocks
+ORDER BY scope_name, target_name
+"""
+
 
 # --- neo4j plumbing ---
 
@@ -281,6 +343,16 @@ class QuickWins:
     unconstrained: list[dict] = field(default_factory=list)
     paths: list[dict] = field(default_factory=list)
     owned_count: int = 0
+    notes: list[str] = field(default_factory=list)
+
+
+@dataclass
+class GpoScope:
+    gpo_name: str = ""
+    links: list[dict] = field(default_factory=list)
+    in_scope: list[dict] = field(default_factory=list)
+    excluded: list[dict] = field(default_factory=list)
+    controllers: list[dict] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
 
@@ -352,10 +424,135 @@ def gather(client: Neo4jClient, domain: Optional[str], rids: list[str],
                 f"Dropped {dropped} candidate path(s) that only reached the target via "
                 f"structural edges ({', '.join(sorted(_STRUCTURAL_EDGE_TYPES))}) rather than "
                 "real control - containment isn't compromise. If a GenericAll/WriteOwner/"
-                "GenericWrite hit on a GPO looked promising, check its linked scope manually."
+                "GenericWrite hit on a GPO looked promising, resolve what it actually "
+                "reaches with: bh-quickwin gpo-scope '<GPO NAME>'"
             )
 
     return wins
+
+
+def _resolve_inheritance(rows: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Apply the one AD rule that decides whether a linked GPO actually reaches an
+    object: an OU with blockInheritance set cuts off GPOs linked above it, unless
+    that link is Enforced, which wins over the block.
+
+    nodes[0] of each chain is the link target itself - a block flag there is about
+    what it inherits from *above*, not about a GPO linked directly to it, so only
+    nodes[1:] can cut this path off.
+    """
+    in_scope, excluded = [], []
+    for row in rows:
+        if not row.get("target_name"):
+            continue  # link target has no User/Computer under it
+        chain = row.get("chain") or []
+        blocks = row.get("blocks") or []
+        blocking = [
+            chain[i] for i in range(1, len(blocks))
+            if blocks[i] and i < len(chain)
+        ]
+        entry = {
+            "name": row["target_name"],
+            "kind": "Computer" if "Computer" in (row.get("target_labels") or []) else "User",
+            "is_dc": bool(row.get("is_dc")),
+            "scope_name": row.get("scope_name"),
+            "enforced": bool(row.get("enforced")),
+            "chain": chain,
+        }
+        if blocking and not row.get("enforced"):
+            entry["blocked_by"] = blocking
+            excluded.append(entry)
+        else:
+            if blocking:
+                entry["enforced_over_block"] = blocking
+            in_scope.append(entry)
+    return in_scope, excluded
+
+
+def _dedupe_by_name(rows: list[dict]) -> list[dict]:
+    """The same object can be reached through more than one link; report it once,
+    preferring the entry that actually lands in scope."""
+    best: dict[str, dict] = {}
+    for row in rows:
+        cur = best.get(row["name"])
+        if cur is None:
+            best[row["name"]] = row
+    return sorted(best.values(), key=lambda r: (r["kind"] != "Computer", not r["is_dc"], r["name"]))
+
+
+def gather_gpo_scope(client: Neo4jClient, name: Optional[str]) -> GpoScope:
+    """name=None lists every GPO someone holds a control edge on; a name resolves
+    that one GPO's applied scope."""
+    scope = GpoScope(gpo_name=name or "")
+
+    raw_ctl = _scrub_rows(client.read(Q_GPO_CONTROLLERS, name=name))
+    for row in raw_ctl:
+        members = [m for m in (row.get("members") or [])
+                   if isinstance(m, dict) and m.get("name")]
+        row["members"] = members
+        row["owned_members"] = [m["name"] for m in members if m.get("owned")]
+        row["is_group"] = "Group" in (row.get("principal_labels") or [])
+    scope.controllers = raw_ctl
+
+    if name is None:
+        if not scope.controllers:
+            scope.notes.append(
+                "No GPO in this graph has an inbound control edge (Owns/GenericAll/"
+                "GenericWrite/WriteOwner/WriteDacl/AllExtendedRights)."
+            )
+        else:
+            scope.notes.append(
+                "Listing GPOs with a control edge. Re-run with a GPO name to see what "
+                "that policy actually applies to."
+            )
+        return scope
+
+    rows = _scrub_rows(client.read(Q_GPO_SCOPE, name=name))
+    if not rows:
+        scope.notes.append(
+            f"No GPO named {name!r} is linked anywhere in this graph. Names are "
+            "UPPERCASE and usually FQDN-suffixed, e.g. 'DEFAULT DOMAIN POLICY@CORP.LOCAL'; "
+            "the objectid GUID works too. Run `bh-quickwin gpo-scope` with no name to "
+            "list the GPOs that have a control edge."
+        )
+        return scope
+
+    seen_links = set()
+    for row in rows:
+        key = (row.get("scope_name"), bool(row.get("enforced")))
+        if key in seen_links:
+            continue
+        seen_links.add(key)
+        labels = row.get("scope_labels") or []
+        scope.links.append({
+            "scope_name": row.get("scope_name"),
+            "kind": ("Domain" if "Domain" in labels
+                     else "OU" if "OU" in labels
+                     else (labels[0] if labels else "?")),
+            "enforced": bool(row.get("enforced")),
+        })
+
+    raw_in, raw_out = _resolve_inheritance(rows)
+    scope.in_scope = _dedupe_by_name(raw_in)
+    in_names = {r["name"] for r in scope.in_scope}
+    scope.excluded = _dedupe_by_name([r for r in raw_out if r["name"] not in in_names])
+
+    dcs = [r for r in scope.in_scope if r["is_dc"]]
+    if dcs:
+        scope.notes.append(
+            f"This GPO applies to {len(dcs)} domain controller(s): "
+            f"{', '.join(r['name'] for r in dcs)}. Code pushed through it runs as SYSTEM there."
+        )
+    else:
+        scope.notes.append(
+            "No domain controller falls in this GPO's applied scope - it reaches "
+            "member objects only."
+        )
+    scope.notes.append(
+        "Scope here is link + inheritance only. BloodHound does NOT collect GPO "
+        "security filtering or WMI filters, so an object listed below can still be "
+        "filtered out in reality - confirm on the box before relying on it."
+    )
+    return scope
 
 
 # --- rendering ---
@@ -461,6 +658,137 @@ def render_plain(wins: QuickWins) -> None:
         print(f"  [{r.get('hops')} hops] {_path_str(r)}")
 
 
+def _ctl_label(row: dict) -> str:
+    tag = ""
+    if row.get("owned"):
+        tag = "  [owned]"
+    elif row.get("owned_members"):
+        tag = f"  [owned member: {', '.join(row['owned_members'])}]"
+    return tag
+
+
+def render_gpo_scope_rich(scope: GpoScope) -> None:
+    console = Console()
+    for note in scope.notes:
+        console.print(f"[dim]{note}[/dim]")
+
+    if scope.controllers:
+        title = ("GPOs with a control edge" if not scope.gpo_name
+                 else f"Who can rewrite this GPO ({len(scope.controllers)})")
+        ct = Table(title=f"{title}")
+        for col in ("GPO", "Principal", "Edge", "Via"):
+            ct.add_column(col, overflow="fold")
+        for r in scope.controllers:
+            owned = r.get("owned") or r.get("owned_members")
+            principal = Text(str(r.get("principal")), style="bold red" if owned else "yellow")
+            via = ""
+            if r.get("is_group"):
+                names = [m["name"] for m in r.get("members", [])]
+                via = f"group, {len(names)} member(s)"
+                if r.get("owned_members"):
+                    via += f" - owned: {', '.join(r['owned_members'])}"
+            elif r.get("owned"):
+                via = "owned"
+            ct.add_row(str(r.get("gpo")), principal, str(r.get("edge")), via)
+        console.print(ct)
+
+    if not scope.gpo_name:
+        return
+
+    lt = Table(title=f"Linked at ({len(scope.links)})")
+    for col in ("Scope", "Kind", "Enforced"):
+        lt.add_column(col)
+    for l in scope.links:
+        lt.add_row(str(l["scope_name"]), l["kind"], "yes" if l["enforced"] else "no")
+    console.print(lt)
+
+    st = Table(title=f"Objects this GPO applies to ({len(scope.in_scope)})")
+    for col in ("Object", "Type", "Domain Controller?"):
+        st.add_column(col)
+    for r in scope.in_scope:
+        style = "bold red" if r["is_dc"] else ("cyan" if r["kind"] == "Computer" else "")
+        st.add_row(Text(r["name"], style=style), r["kind"],
+                   "YES - SYSTEM on the DC" if r["is_dc"] else "no")
+    console.print(st)
+
+    if scope.excluded:
+        xt = Table(title=f"Cut off by blocked inheritance ({len(scope.excluded)})")
+        for col in ("Object", "Type", "Blocked at"):
+            xt.add_column(col, overflow="fold")
+        for r in scope.excluded:
+            xt.add_row(r["name"], r["kind"], ", ".join(r.get("blocked_by") or []))
+        console.print(xt)
+
+
+def render_gpo_scope_plain(scope: GpoScope) -> None:
+    use_color = sys.stdout.isatty()
+
+    def c(text: str, code: str) -> str:
+        return f"\033[{code}m{text}\033[0m" if use_color else text
+
+    for note in scope.notes:
+        print(note)
+
+    if scope.controllers:
+        header = ("GPOs with a control edge" if not scope.gpo_name
+                  else "Who can rewrite this GPO")
+        print(f"\n=== {header} ({len(scope.controllers)}) ===")
+        for r in scope.controllers:
+            owned = r.get("owned") or r.get("owned_members")
+            nm = c(str(r.get("principal")), "1;31") if owned else str(r.get("principal"))
+            extra = ""
+            if r.get("is_group"):
+                extra = f"  (group, {len(r.get('members', []))} member(s))"
+            print(f"  {r.get('gpo')}  <-[{r.get('edge')}]-  {nm}{extra}{_ctl_label(r)}")
+
+    if not scope.gpo_name:
+        return
+
+    print(f"\n=== Linked at ({len(scope.links)}) ===")
+    if not scope.links:
+        print("  (none)")
+    for l in scope.links:
+        enf = "  [ENFORCED]" if l["enforced"] else ""
+        print(f"  {l['scope_name']}  ({l['kind']}){enf}")
+
+    print(f"\n=== Objects this GPO applies to ({len(scope.in_scope)}) ===")
+    if not scope.in_scope:
+        print("  (none)")
+    for r in scope.in_scope:
+        if r["is_dc"]:
+            print(f"  {c(r['name'], '1;31')}  {r['kind']}  {c('<- domain controller, SYSTEM', '1;31')}")
+        else:
+            print(f"  {r['name']}  {r['kind']}")
+
+    if scope.excluded:
+        print(f"\n=== Cut off by blocked inheritance ({len(scope.excluded)}) ===")
+        for r in scope.excluded:
+            print(f"  {r['name']}  {r['kind']}  blocked at {', '.join(r.get('blocked_by') or [])}")
+
+
+def build_gpo_json(scope: GpoScope, uri: str) -> dict:
+    if scope.gpo_name:
+        summary = (f"{len(scope.in_scope)} object(s) in scope, "
+                   f"{sum(1 for r in scope.in_scope if r['is_dc'])} DC(s), "
+                   f"{len(scope.controllers)} controller edge(s)")
+    else:
+        summary = f"{len(scope.controllers)} GPO control edge(s)"
+    return envelope(
+        tool="bh-quickwin",
+        tool_version=__version__,
+        subject=scope.gpo_name or uri,
+        summary=summary,
+        notes=[scrub(n, limit=500) for n in scope.notes],
+        data={
+            "gpo": scope.gpo_name,
+            "links": scope.links,
+            "controllers": scope.controllers,
+            "in_scope": scope.in_scope,
+            "excluded_by_blocked_inheritance": scope.excluded,
+        },
+    )
+
+
 def write_markdown(wins: QuickWins, out_path) -> None:
     L = ["# BloodHound Quick-Wins", ""]
     for note in wins.notes:
@@ -525,6 +853,12 @@ _EXAMPLES = """examples:
 
   bh-quickwin check
       just prove the bolt connection works
+
+  bh-quickwin gpo-scope
+      which GPOs anyone holds a control edge on, and who holds it
+
+  bh-quickwin gpo-scope 'DEFAULT DOMAIN POLICY@CORP.LOCAL'
+      what that policy actually applies to - the question `wins` can't answer
 """
 
 
@@ -570,6 +904,21 @@ def build_parser() -> argparse.ArgumentParser:
     out.add_argument("--markdown", metavar="FILE", help="also write a Markdown report here")
     out.add_argument("--json", dest="json_out", metavar="FILE",
                      help="write machine-readable JSON ('-' for stdout, which hides the tables)")
+
+    gpo = subs.add_parser(
+        "gpo-scope", help="what a GPO applies to, and who can rewrite it",
+        description="Resolve a GPO's applied scope (links + inheritance) and its\n"
+                    "controllers. This is the deliberate counterpart to `wins`:\n"
+                    "Contains/GPLink are the wrong edges for 'what did I compromise'\n"
+                    "and the right ones for 'what does this policy reach'.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    add_connection_options(gpo)
+    gpo.add_argument("gpo_name", nargs="?", metavar="GPO",
+                     help="GPO name (e.g. 'DEFAULT DOMAIN POLICY@CORP.LOCAL'); "
+                          "omit to list every GPO with a control edge")
+    gpo.add_argument("--json", dest="json_out", metavar="FILE",
+                     help="write machine-readable JSON ('-' for stdout)")
 
     check = subs.add_parser(
         "check", help="prove the bolt connection works, then stop",
@@ -651,6 +1000,17 @@ def run_command(args: argparse.Namespace) -> int:
             elif not quiet:
                 print(f"connected to {uri} - {count} node(s) in the graph")
             return EXIT_OK if count else EXIT_NO_DATA
+
+        if args.command == "gpo-scope":
+            scope = gather_gpo_scope(client, validate_gpo_name(args.gpo_name))
+            if not quiet:
+                if _RICH:
+                    render_gpo_scope_rich(scope)
+                else:
+                    render_gpo_scope_plain(scope)
+            if args.json_out:
+                emit_json(build_gpo_json(scope, uri), args.json_out)
+            return EXIT_OK if (scope.in_scope or scope.controllers) else EXIT_NO_DATA
 
         domain = validate_domain(args.domain)
         rids = validate_rids(args.target_rids)

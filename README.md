@@ -85,7 +85,7 @@ To update, `git pull` and run it again.
 | `http-serve` | Serves a loot dir and prints paste-ready `certutil`/`wget` lines with your tun0 IP filled in — then logs every request so you know the transfer landed |
 | `ad-enum` | One credential, one DC, five read-only enumeration stages merged into one report, with automatic fallbacks when nxc is unhappy |
 | `hash-triage` | Classifies a pile of found hashes, splits them per hashcat mode, runs a local wordlist pass and reports what cracked |
-| `bh-quickwin` | Reads roastable accounts, unconstrained delegation and owned→DA paths straight out of the BloodHound graph |
+| `bh-quickwin` | Reads roastable accounts, unconstrained delegation and owned→DA paths straight out of the BloodHound graph — plus `gpo-scope`, which resolves what a writable GPO actually applies to |
 | `ligolo-pivot` | The tun + route dance for Ligolo-ng in one command, idempotent in both directions |
 | `script-logger` | Records the terminal per box, builds the evidence tree, and keeps a timestamped command timeline |
 | `mark` | Stamps a marker into the current `script-logger` session — same tool, second entry point |
@@ -144,6 +144,7 @@ also work.
 ```
 ad-enum sweep …        → kerb.<dc>.txt / asrep.<dc>.txt  → hash-triage crack …
 ad-enum "writable"     → confirm the abuse path in       → bh-quickwin wins
+bh-quickwin wins       → a writable GPO looked useful   → bh-quickwin gpo-scope
 nmap-recon --json      → ports worth a closer look
 ```
 
@@ -224,6 +225,8 @@ Concretely, where each one stops:
   cracking service.
 - `bh-quickwin` — BloodHound is explicitly allowed. This only re-reads its graph and
   annotates owned, the same as right-clicking in the GUI. Every hop is still yours.
+  `gpo-scope` reads a GPO's links and inheritance; it never edits a GPO or tells you
+  which payload to push through one.
 - `http-serve` / `ligolo-pivot` — transport and file transfer. They never contact a
   target or choose a payload.
 - `script-logger` / `mark` — documentation only. Records your own terminal.
@@ -231,6 +234,17 @@ Concretely, where each one stops:
 One caveat that isn't about this code: if you use LinPEAS, keep it in plain
 enumeration mode and never invoke its exploit features. That's the exact scenario
 OffSec has publicly ruled on.
+
+**`gpo-scope` tells you a GPO's *link* scope, not its *effective* scope.** It
+resolves GPLink plus Contains and applies the one inheritance rule that BloodHound
+does collect — an OU with blockInheritance cuts off GPOs linked above it, unless
+the link is Enforced, which wins. What BloodHound does **not** collect is GPO
+security filtering and WMI filters, so an object listed as in-scope can still be
+filtered out on the real box. Confirm before you spend exam time on it. Related:
+the GPO-name allow-list deliberately excludes `$ & ( ) '`, because a looser first
+version accepted `$(whoami)` and `&& reboot` as GPO names. A GPO whose real name
+needs those characters is rejected outright — pass its objectid GUID instead,
+which the lookup also accepts.
 
 ## Known gaps
 
@@ -246,13 +260,12 @@ relationship-type filter, so it happily walked `Contains`/`GPLink` (AD
 they were control edges, and reported a path to Domain Admins that was only
 genuine for its first few hops. Fixed in 2.1.4 by rejecting any candidate path
 that touches a structural edge anywhere in the chain, rather than trying to
-guess which GPO-scope hops are meaningful. **Still open:** this makes
-GPO-abuse paths (WriteOwner/GenericWrite/GenericAll on a GPO) disappear from
-`wins` entirely rather than resolving them correctly — Neo4j 4.4 can't exclude
-relationship types from a variable-length pattern without APOC, so there's no
-cheap way to keep the real GPO-scope hop and still drop the bogus containment
-one. Check GPO-linked scope by hand (BloodHound GUI or `bloodyAD` reads) when
-a GPO shows up as writable. Also unconfirmed: whether `rusthound` (the
+guess which GPO-scope hops are meaningful. That means GPO-abuse paths
+(WriteOwner/GenericWrite/GenericAll on a GPO) don't appear in `wins` at all —
+which is why **2.2.0 adds `gpo-scope`** to answer that question directly instead
+of leaving it as a manual check. **Still true:** `wins` alone will never show you
+a GPO route to DA, so treat an empty paths table as "no *group* path", not "no
+path" — run `gpo-scope` when a GPO shows up writable. Also unconfirmed: whether `rusthound` (the
 collector used for that run) requests Session/ACL edges by default — until
 that's checked, an empty `wins` result on a rusthound-collected graph could
 mean "no path" or "collector didn't gather what a path needs".
