@@ -47,6 +47,12 @@ USER_RE = re.compile(r"^[A-Za-z0-9_.-]{1,32}$")     # tun owner (root in Exegol)
 BIN_RE = re.compile(r"^[A-Za-z0-9_./-]+$")          # proxy binary name or path
 PROXY_ARG_RE = re.compile(r"^[A-Za-z0-9_.:/=-]+$")  # passthrough tokens for `proxy`
 
+# The ligolo-ng proxy binary goes by different names depending on how it was installed:
+# upstream releases ship it as `proxy`; Exegol symlinks it onto $PATH as `ligolo-ng`
+# (/opt/tools/bin/ligolo-ng); Kali's package installs it as `ligolo-proxy`. When --proxy-bin
+# isn't given we try these in order and take the first that resolves, instead of assuming one.
+PROXY_BIN_CANDIDATES = ("proxy", "ligolo-ng", "ligolo-proxy")
+
 
 def _die(msg):
     """Fatal, and always EXIT_USAGE. This used to exit 2, which in the suite now
@@ -102,6 +108,7 @@ def valid_laddr(host, port):
 
 
 def valid_proxy_bin(name):
+    """Validate + resolve a single, explicitly-given proxy binary (name or path)."""
     if not BIN_RE.match(name):
         _die(f"bad --proxy-bin {name!r}")
     if "/" in name:  # an explicit path has to exist and be executable
@@ -110,8 +117,26 @@ def valid_proxy_bin(name):
         return name
     resolved = shutil.which(name)
     if not resolved:
-        _die(f"--proxy-bin {name!r} not found on $PATH (Exegol ships it as `proxy`)")
+        _die(f"--proxy-bin {name!r} not found on $PATH (Exegol ships it as `ligolo-ng`)")
     return resolved
+
+
+def resolve_proxy_bin(name):
+    """Resolve the proxy binary for `up`.
+
+    name given -> honour it exactly (path or single name), erroring if it won't resolve.
+    name None  -> auto-detect: try each known candidate name on $PATH, first hit wins.
+    Auto-detect only searches $PATH names, never a path, so it can't be steered at a file.
+    """
+    if name is not None:
+        return valid_proxy_bin(name)
+    for cand in PROXY_BIN_CANDIDATES:
+        resolved = shutil.which(cand)
+        if resolved:
+            return resolved
+    tried = ", ".join(f"`{c}`" for c in PROXY_BIN_CANDIDATES)
+    _die(f"no ligolo proxy binary found on $PATH (looked for {tried}); "
+         "Exegol ships it as `ligolo-ng` — pass --proxy-bin to point at it explicitly")
 
 
 def valid_proxy_args(args):
@@ -171,7 +196,7 @@ def cmd_up(args):
     require_root()
     iface = valid_iface(args.iface)
     user = valid_user(args.user)
-    proxy_bin = valid_proxy_bin(args.proxy_bin)  # resolve before touching the interface
+    proxy_bin = resolve_proxy_bin(args.proxy_bin)  # resolve before touching the interface
     laddr = valid_laddr(args.laddr, args.port)
     extra = valid_proxy_args(args.proxy_arg)
 
@@ -316,8 +341,9 @@ def build_parser():
     up = sub.add_parser("up", help="create/raise the tun, then exec the proxy console")
     up.add_argument("--user", default="root",
                     help="tun owner for `ip tuntap add user` (default: root)")
-    up.add_argument("--proxy-bin", default="proxy",
-                    help="proxy binary name/path (default: proxy on $PATH)")
+    up.add_argument("--proxy-bin", default=None,
+                    help="proxy binary name/path (default: auto-detect "
+                         "proxy/ligolo-ng/ligolo-proxy on $PATH)")
     up.add_argument("--laddr", default="0.0.0.0", help="proxy listen host (default: 0.0.0.0)")
     up.add_argument("--port", type=int, default=11601, help="proxy listen port (default: 11601)")
     up.add_argument("--no-selfcert", action="store_true",
